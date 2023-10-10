@@ -20,7 +20,7 @@ from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 
 from tensordict import TensorDict
-# from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
+from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 
 if gym.__version__ < '0.26':
     env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", new_step_api=True)
@@ -135,7 +135,7 @@ class Mario:
         Outputs: ``action_idx``(``int``) - an integer representing Mario's actions
         """
        # Explore 
-       if np.random.rand() < self.exploration_rate:
+        if np.random.rand() < self.exploration_rate:
             action_idx = np.random.randint(self.action_dim)
         
         # Exploit
@@ -152,6 +152,12 @@ class Mario:
         self.curr_step += 1
         return action_idx
 
+
+class Mario(Mario):  # subclassing for continuity
+    def __init__(self, state_dim, action_dim, save_dir):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
+        self.batch_size = 32
     
     def cache(self, state, next_state, action, reward, done):
         # Save to memory
@@ -177,41 +183,42 @@ class Mario:
         state, next_state, action, reward, done = (batch.get(key) for key in ("state", "next_state", "action", "reward", "done"))
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
-    def learn(self):
-        # Update Q function (Q learning) with experiences
-        def __init__(self, input_dim, output_dim):
-            super().__init__()
-            c, h, w = input_dim
 
-            if h != 84:
-                raise ValueError(f"Expected input height 84, got {h}")
-            if w != 84:
-                raise ValueError(f"Expected input width 84, got {w}")
+class MarioNet(nn.Module):
+    # Update Q function (Q learning) with experiences
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        c, h, w = input_dim
 
-            self.online = nn.Sequential(
-                    nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
-                    nn.ReLU(),
-                    nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
-                    nn.ReLU(), 
-                    nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
-                    nn.ReLU(),
-                    nn.Flatten()
-                    nn.Linear(3136, 512),
-                    nn.ReLU(),
-                    nn.Linear(512, output_dim),
-                )
+        if h != 84:
+            raise ValueError(f"Expected input height 84, got {h}")
+        if w != 84:
+            raise ValueError(f"Expected input width 84, got {w}")
 
-            self.target = copy.deepcopy(self.online)
+        self.online = nn.Sequential(
+                nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+                nn.ReLU(), 
+                nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(3136, 512),
+                nn.ReLU(),
+                nn.Linear(512, output_dim),
+            )
 
-            # Q_target parameters are frozen
-            for p in self.target.parameters():
-                p.requires_grad = False
+        self.target = copy.deepcopy(self.online)
 
-        def forward(self, input, model):
-            if model == "online":
-                return self.online(input)
-            elif model == "target":
-                return self.target(input)
+        # Q_target parameters are frozen
+        for p in self.target.parameters():
+            p.requires_grad = False
+
+    def forward(self, input, model):
+        if model == "online":
+            return self.online(input)
+        elif model == "target":
+            return self.target(input)
 
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
@@ -364,7 +371,7 @@ class MetricLogger:
         self.curr_ep_q = 0.0
         self.curr_ep_loss_length = 0
 
-        def record(self, episode, epsilon, step):
+    def record(self, episode, epsilon, step):
         mean_ep_reward = np.round(np.mean(self.ep_rewards[-100:]), 3)
         mean_ep_length = np.round(np.mean(self.ep_lengths[-100:]), 3)
         mean_ep_loss = np.round(np.mean(self.ep_avg_losses[-100:]), 3)
@@ -403,5 +410,48 @@ class MetricLogger:
             plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
             plt.legend()
             plt.savefig(getattr(self, f"{metric}_plot"))
+
+use_cuda = torch.cuda.is_available()
+print(f"Using CUDA: {use_cuda}")
+print()
+
+save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+save_dir.mkdir(parents=True)
+
+mario = Mario(state_dim=(4, 84, 84), action_dim = env.action_space.n, save_dir=save_dir)
+
+logger = MetricLogger(save_dir)
+
+episodes = 40
+for e in range(episodes):
+    state = env.reset()
+    
+    # Play!
+    while True:
+        action = mario.act(state)
+        next_state, reward, done, trunc, info = env.step(action)
+
+        mario.cache(state, next_state, action, reward, done)
+
+        # Learn
+        q, loss = mario.learn()
+
+        # Log
+        logger.log_step(reward, loss, q)
+
+        # Update state
+        state = next_state
+
+        # Check if game ended
+        if done or info["flag_get"]:
+            break
+
+logger.log_episode()
+
+if e % 20 == 0:
+    logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
+
+
+
 
 
